@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Flash sequence detector</title>
+<style>
+:root{--bg:#eceef1;--panel:#fff;--ink:#1d2433;--mute:#667085;--line:#dfe2e8;--accent:#e84c3d;--btn:#1d2433;--btnink:#fff;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#14161b;--panel:#1f2229;--ink:#eceef2;--mute:#9aa0ad;--line:#363a45;--btn:#eceef2;--btnink:#14161b}}
+:root[data-theme="dark"]{--bg:#14161b;--panel:#1f2229;--ink:#eceef2;--mute:#9aa0ad;--line:#363a45;--btn:#eceef2;--btnink:#14161b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Segoe UI",Tahoma,Verdana,sans-serif;line-height:1.5}
+main{max-width:720px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:1.4rem;margin:0 0 4px}
+.sub{color:var(--mute);margin:0 0 14px;font-size:.92rem}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.stage{position:relative;background:#000;border-radius:8px;overflow:hidden;aspect-ratio:4/3}
+.stage video,.stage canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:12px}
+button{font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 14px;cursor:pointer}
+button.primary{background:var(--btn);color:var(--btnink);border-color:var(--btn)}
+label{color:var(--mute);font-size:.88rem}
+.now{font-weight:bold;min-height:1.6em;margin-top:10px}
+.big{font-size:1.3rem;font-weight:bold;margin:4px 0 8px;overflow-wrap:anywhere}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:560px){.two{grid-template-columns:1fr}}
+#map{width:100%;height:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px}
+ol{margin:6px 0 0;padding-left:20px;font-size:.9rem}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+</style>
+</head>
+<body>
+<main>
+<h1>Flash sequence detector</h1>
+<p class="sub">Computer-vision demo: a camera watches a screen, finds red flashes, and reports their order the moment each one appears.</p>
+
+<div class="panel">
+  <div class="stage">
+    <video id="v" playsinline muted></video>
+    <canvas id="demo" width="320" height="240" hidden></canvas>
+    <canvas id="ov"></canvas>
+  </div>
+  <div class="now" id="now" role="status" aria-live="polite">Press “Start camera” or “Self-test”.</div>
+  <div class="row">
+    <button class="primary" id="cam">Start camera</button>
+    <button id="selftest">Self-test (no camera)</button>
+    <button id="stop">Stop</button>
+    <button id="reset">Forget dots</button>
+  </div>
+  <div class="row">
+    <label for="diff">Red strictness</label>
+    <input id="diff" type="range" min="40" max="170" value="90">
+    <span id="diffv" class="sub" style="margin:0">90</span>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="two">
+    <div>
+      <strong>Latest sequence</strong>
+      <div class="big" id="big">None yet</div>
+      <ol id="list"></ol>
+    </div>
+    <div><canvas id="map" width="320" height="240" aria-label="Map of detected dots with order numbers"></canvas></div>
+  </div>
+</div>
+</main>
+
+<script>
+(function(){
+  var $=function(i){return document.getElementById(i)};
+  var v=$('v'),demo=$('demo'),ov=$('ov'),octx=ov.getContext('2d'),mapc=$('map'),mctx=mapc.getContext('2d');
+  var dctx=demo.getContext('2d');
+  var cv=document.createElement('canvas'),ctx=cv.getContext('2d',{willReadFrequently:true});
+  var W=160,H=120,R=7,MISS=3,GAPMS=3000;
+  var src=v,spots=[],round=null,lastEv=0,rounds=0,timer=null,dtimer=null,stream=null,t0=0;
+  $('diff').addEventListener('input',function(){$('diffv').textContent=$('diff').value});
+  function now(m){$('now').textContent=m}
+
+  function stopAll(){
+    if(timer){clearInterval(timer);timer=null}
+    if(dtimer){clearInterval(dtimer);dtimer=null}
+    if(stream){stream.getTracks().forEach(function(t){t.stop()});stream=null}
+    octx.clearRect(0,0,ov.width,ov.height);
+  }
+  function resetData(){spots=[];round=null;rounds=0;lastEv=0;$('big').textContent='None yet';$('list').innerHTML='';drawMap()}
+  function setup(vw,vh){
+    H=Math.max(2,Math.round(W*vh/vw));cv.width=W;cv.height=H;
+    ov.width=W*3;ov.height=H*3;mapc.width=W*2;mapc.height=H*2;
+    document.querySelector('.stage').style.aspectRatio=vw+'/'+vh;
+  }
+  function begin(){t0=performance.now();timer=setInterval(tick,50);drawMap()}
+
+  $('cam').addEventListener('click',function(){
+    stopAll();resetData();demo.hidden=true;v.hidden=false;src=v;
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){now('Camera not available here. Open this page directly in your browser, or try Self-test.');return}
+    now('Asking for camera access…');
+    navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false}).then(function(s){
+      stream=s;v.srcObject=s;v.play();
+      v.onloadedmetadata=function(){setup(v.videoWidth,v.videoHeight);now('Watching… point it at the game screen.');begin()};
+    }).catch(function(e){now('Camera blocked ('+(e&&e.name||'error')+'). Allow access or try Self-test.')});
+  });
+  $('stop').addEventListener('click',function(){stopAll();now('Stopped.')});
+  $('reset').addEventListener('click',function(){resetData();now('Cleared. Watching for new flashes.')});
+
+  // Self-test: draws its own dots and flashes sequences so the detector can be shown without a camera
+  $('selftest').addEventListener('click',function(){
+    stopAll();resetData();v.hidden=true;demo.hidden=false;src=demo;setup(320,240);
+    var pts=[],tries=0;
+    while(pts.length<13&&tries<4000){tries++;var x=20+Math.random()*280,y=20+Math.random()*200,ok=true;
+      pts.forEach(function(p){if(Math.hypot(p[0]-x,p[1]-y)<36)ok=false});if(ok)pts.push([x,y])}
+    var seq=[],start=0;
+    function newRound(){var len=3+Math.floor(Math.random()*3);seq=[];
+      while(seq.length<len){var k=Math.floor(Math.random()*pts.length);if(seq.indexOf(k)<0)seq.push(k)}
+      start=performance.now()+800}
+    newRound();
+    dtimer=setInterval(function(){
+      var t=performance.now();dctx.fillStyle='#fff';dctx.fillRect(0,0,320,240);
+      var idx=Math.floor((t-start)/900),on=((t-start)%900)<650&&idx>=0&&idx<seq.length?seq[idx]:-1;
+      pts.forEach(function(p,i){dctx.beginPath();dctx.arc(p[0],p[1],13,0,6.283);dctx.fillStyle=i===on?'#e84c3d':'#b3b3b3';dctx.fill()});
+      if(t-start>seq.length*900+3600)newRound();
+    },33);
+    now('Self-test running: the detector is watching a simulated game.');begin();
+  });
+
+  function tick(){
+    var t=(performance.now()-t0)/1000,diff=+$('diff').value;
+    try{ctx.drawImage(src,0,0,W,H)}catch(e){return}
+    var d=ctx.getImageData(0,0,W,H).data,m=new Uint8Array(W*H),i;
+    for(i=0;i<W*H;i++){var o=i*4,r=d[o],g=d[o+1],b=d[o+2];if(r>140&&r-Math.max(g,b)>diff)m[i]=1}
+    var seen={};
+    comps(m).forEach(function(b){
+      var best=null,bd=R;
+      spots.forEach(function(s){var dd=Math.hypot(s.x-b.x,s.y-b.y);if(dd<bd){bd=dd;best=s}});
+      if(!best){best={id:spots.length,x:b.x,y:b.y,on:false,miss:0};spots.push(best)}
+      best.miss=0;seen[best.id]=1;
+      if(!best.on){best.on=true;flash(best,t)}
+    });
+    spots.forEach(function(s){if(!seen[s.id]){s.miss++;if(s.on&&s.miss>=MISS)s.on=false}});
+    drawOv();
+  }
+
+  function flash(s,t){
+    if(!round||t-lastEv>GAPMS/1000){round={ev:[]};rounds++;$('list').innerHTML=''}
+    round.ev.push({spot:s.id,t:t});lastEv=t;
+    var n=round.ev.length;
+    now('Dot '+n+' just flashed at '+Math.round(s.x/W*100)+'% across, '+Math.round(s.y/H*100)+'% down.');
+    $('big').textContent=round.ev.map(function(e,i){return '#'+(i+1)}).join(' → ');
+    var li=document.createElement('li');
+    li.textContent='Dot '+n+': '+Math.round(s.x/W*100)+'% across, '+Math.round(s.y/H*100)+'% down, at '+t.toFixed(1)+' s';
+    $('list').appendChild(li);drawMap();
+  }
+
+  function numsFor(id){var a=[];if(round)round.ev.forEach(function(e,i){if(e.spot===id)a.push(i+1)});return a}
+
+  function drawOv(){
+    var k=ov.width/W;octx.clearRect(0,0,ov.width,ov.height);octx.lineWidth=2;octx.font='bold 15px Verdana';
+    spots.forEach(function(s){
+      if(!s.on)return;octx.strokeStyle='#ffd400';octx.fillStyle='#ffd400';
+      octx.beginPath();octx.arc(s.x*k,s.y*k,15,0,6.283);octx.stroke();
+      var n=numsFor(s.id);if(n.length)octx.fillText(n.join(','),s.x*k+17,s.y*k-10);
+    });
+  }
+
+  function drawMap(){
+    var k=mapc.width/W;mctx.clearRect(0,0,mapc.width,mapc.height);
+    var dark=matchMedia('(prefers-color-scheme: dark)').matches;
+    mctx.font='bold 13px Verdana';mctx.textAlign='center';mctx.textBaseline='middle';
+    spots.forEach(function(s){
+      var n=numsFor(s.id);
+      mctx.beginPath();mctx.arc(s.x*k,s.y*k,11,0,6.283);
+      mctx.fillStyle=n.length?'#e84c3d':(dark?'#555a66':'#b3b3b3');mctx.fill();
+      if(n.length){mctx.fillStyle='#fff';mctx.fillText(n.join(','),s.x*k,s.y*k+1)}
+    });
+  }
+
+  function comps(m){
+    var seen=new Uint8Array(W*H),out=[],st=[],i,j;
+    for(i=0;i<W*H;i++){
+      if(!m[i]||seen[i])continue;
+      var n=0,sx=0,sy=0;st.length=0;st.push(i);seen[i]=1;
+      while(st.length){
+        j=st.pop();var x=j%W,y=(j-x)/W;n++;sx+=x;sy+=y;
+        for(var dy=-1;dy<=1;dy++)for(var dx=-1;dx<=1;dx++){
+          var nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=W||ny>=H)continue;
+          var kk=ny*W+nx;if(m[kk]&&!seen[kk]){seen[kk]=1;st.push(kk)}
+        }
+      }
+      if(n>=3&&n<W*H*0.05)out.push({x:sx/n,y:sy/n,n:n});
+    }
+    return out;
+  }
+  drawMap();
+})();
+</script>
+</body>
+</html>
